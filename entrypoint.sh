@@ -9,9 +9,9 @@ fi
 DATA_DIR="${DATA_DIR:-/data}"
 BOT_UID="${BOT_UID:-10001}"
 
-# تحديث المحركات عشان تفضل متوافقة مع المواقع (لو فشل بنكمل بالنسخة المثبّتة)
+# تحديث المحركات عشان تفضل متوافقة مع المواقع (لو فشل بنكمل بالنسخة المثبّتة). --timeout عشان النت البطيء ما يعطّلش تشغيل البوت
 if [ -z "$SKIP_UPDATE" ]; then
-  pip install -U -q 'yt-dlp[default,curl-cffi]' gallery-dl || echo "engine update failed - using installed versions"
+  pip install -U -q --disable-pip-version-check --timeout 15 --retries 1 'yt-dlp[default,curl-cffi]' gallery-dl || echo "engine update failed - using installed versions"
 fi
 
 if [ "$(id -u)" = "0" ]; then

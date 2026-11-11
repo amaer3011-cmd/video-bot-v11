@@ -7,6 +7,7 @@
 أي فشل بيترفع كاستثناء؛ والمتصل (bot.py) هو اللي بيرجع للمسار القديم.
 """
 import asyncio, functools, inspect, io, logging, math, os, re, threading, time
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urljoin
 
 import requests
@@ -23,6 +24,12 @@ _REDIRECTS = (301, 302, 303, 307, 308)
 _BAD_CTYPE = ("text/", "application/json", "application/vnd.apple", "application/x-mpegurl",
               "application/dash", "application/xml")
 _tls = threading.local()
+
+# thread pool مخصوص لقراءة المصدر (Range). قبل كده كان بيشارك الـ executor العام مع yt-dlp؛ فلو التنزيلات
+# مالية الخيوط، قراءات البث المباشر كانت بتستنى وتتأخر. دلوقتي ليها خيوطها.
+try: _IO_THREADS = max(4, int(os.getenv("FASTIO_THREADS", "48")))
+except ValueError: _IO_THREADS = 48
+_IO_POOL = ThreadPoolExecutor(max_workers=_IO_THREADS, thread_name_prefix="fastio")
 
 
 class DirectError(Exception):
@@ -169,8 +176,13 @@ async def upload_source(client, src, progress=None, progress_args=(), workers=No
     if size <= 0:
         raise ValueError("empty source")
     workers = workers or SETTINGS["workers"]
-    sessions = max(1, min(sessions or SETTINGS["sessions"], workers))
     total_parts = int(math.ceil(size / PART))
+    # حجم الجزء الواحد لكل worker: الملفات المتوسطة بتتقسّم لقطع أصغر عشان كل الـ workers يشتغلوا مع بعض
+    # (قبل كده ملف 12MB كان 3 قطع = 3 workers بس والباقي واقف). الملفات الكبيرة زي ما هي (8 أجزاء = 4MiB).
+    seg_parts = max(1, min(SEG_PARTS, int(math.ceil(total_parts / max(1, workers)))))
+    n_segments = int(math.ceil(total_parts / seg_parts))
+    workers = max(1, min(workers, n_segments))
+    sessions = max(1, min(sessions or SETTINGS["sessions"], workers))   # مفيش داعي نفتح جلسات أكتر من اللي هتشتغل
     loop = asyncio.get_running_loop()
     file_id = client.rnd_id()
     dc_id = await client.storage.dc_id()
@@ -189,8 +201,8 @@ async def upload_source(client, src, progress=None, progress_args=(), workers=No
     else:
         shared = False
 
-    seg_bytes = SEG_PARTS * PART
-    segments = iter(range(int(math.ceil(size / seg_bytes))))
+    seg_bytes = seg_parts * PART
+    segments = iter(range(n_segments))
     state = {"done": 0}
     stop = {"flag": False}
 
@@ -204,7 +216,7 @@ async def upload_source(client, src, progress=None, progress_args=(), workers=No
                 return
             start = seg * seg_bytes
             n = min(seg_bytes, size - start)
-            data = await loop.run_in_executor(None, src.read_range, start, n)
+            data = await loop.run_in_executor(_IO_POOL, src.read_range, start, n)
             for off in range(0, n, PART):
                 if stop["flag"] or is_cancelled():
                     return
@@ -243,11 +255,11 @@ def install(client_cls, enabled=lambda: True):
                 dc_id = await self.storage.dc_id()
                 sess = await self.get_session(dc_id, is_media=True)
                 data = await asyncio.get_running_loop().run_in_executor(
-                    None, path.read_range, file_part * PART, PART)
+                    _IO_POOL, path.read_range, file_part * PART, PART)
                 await _send_part(sess, file_id, file_part, int(math.ceil(path.size / PART)), data)
                 return None
             if path.size <= BIG:               # ملف صغير: المسار الأصلي (md5) بعد قراءته كله
-                data = await asyncio.get_running_loop().run_in_executor(None, path.read_range, 0, path.size)
+                data = await asyncio.get_running_loop().run_in_executor(_IO_POOL, path.read_range, 0, path.size)
                 bio = io.BytesIO(data)
                 bio.name = path.name
                 return await orig(self, bio, None, 0, progress, progress_args)

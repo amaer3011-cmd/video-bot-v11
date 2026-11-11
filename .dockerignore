@@ -5,3 +5,5 @@ __pycache__
 data
 *.db
 *.zip
+tests
+.pytest_cache

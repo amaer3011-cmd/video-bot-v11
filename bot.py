@@ -6,13 +6,13 @@ import os, sys, re, time, uuid, shutil, asyncio, tempfile, sqlite3, threading, l
 from concurrent.futures import ThreadPoolExecutor
 import socket, ipaddress, hashlib, subprocess, urllib.request, urllib.error, copy, inspect
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as dc_replace
 from urllib.parse import urlparse, urljoin
 
 import yt_dlp
 from yt_dlp.extractor import list_extractor_classes
 from pyrogram import Client, filters, idle
-from pyrogram.errors import MessageNotModified, FloodWait
+from pyrogram.errors import MessageNotModified, FloodWait, BadRequest
 from pyrogram.enums import MessageEntityType, ParseMode, ChatMemberStatus
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
 try:
@@ -112,7 +112,20 @@ if SMALL_HOST:
     CONN, FRAGMENTS = min(CONN, 16), min(FRAGMENTS, 16)
 DEFAULT_THREADS = 32 if SMALL_HOST else 128
 # البوت عام افتراضيًا؛ لا حصة أو حد لطول الفيديو المسجل.
-MIN_FREE_MB = 0
+def _env_int(name, default):
+    """رقم صحيح من متغير بيئة (فاضي/غلط = الافتراضي). 0 في حدود التزامن معناها بلا سقف."""
+    try: return max(0, int(float((os.getenv(name) or "").strip() or default)))
+    except ValueError: return default
+
+# ── حدود التزامن (v12): بدل "بلا سقف" اللي كان بيسقّط البوت لما ناس كتير تبعت مع بعض ──
+# بتتظبط تلقائيًا حسب رام الحاوية، وتقدر تغيّرها من Variables. 0 = بلا سقف (زي v11).
+MAX_DL = _env_int("MAX_DOWNLOADS", 3 if SMALL_HOST else 8)           # تنزيلات على السيرفر في نفس اللحظة
+MAX_UP = _env_int("MAX_UPLOADS", 3 if SMALL_HOST else 6)            # رفع/بث مباشر لتليجرام في نفس اللحظة
+MAX_PER_USER = _env_int("MAX_PER_USER", 2 if SMALL_HOST else 4)      # عناصر شغّالة لنفس المستخدم
+MAX_PROBES = _env_int("MAX_PROBES", 4 if SMALL_HOST else 12)         # فحوصات روابط (yt-dlp) متزامنة
+PROBE_TTL = _env_int("PROBE_TTL", 600)                               # ثواني كاش نتيجة الفحص (0 = إيقاف)
+PROBE_CACHE_MAX = 48 if SMALL_HOST else 128
+MIN_FREE_MB = _env_int("MIN_FREE_MB", 300)                           # أقل مساحة فاضية قبل بدء تنزيل جديد
 ALLOWED_IDS = {int(x) for x in os.getenv("ALLOWED_USERS", "").split(",") if x.strip()}
 MAX_SIZE = 2000 * 1024 * 1024
 DB_PATH = os.getenv("DB_PATH") or ("/data/bot.db" if os.path.isdir("/data") else "bot.db")
@@ -165,10 +178,40 @@ app = Client("vidbot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN,
              in_memory=True, workers=32, max_concurrent_transmissions=1)
 app.save_file_semaphore = UNLIMITED
 app.get_file_semaphore = UNLIMITED
-DL_SEM = UP_SEM = PROBE_SEM = UNLIMITED
+
+class Gate:
+    """semaphore حقيقي بسقف (n>0)، أو بلا سقف (n=0). بيعدّ الشغّال والمنتظر عشان التنضيف والمراقبة."""
+    def __init__(self, n):
+        self.n = int(n)
+        self._sem = asyncio.Semaphore(self.n) if self.n > 0 else None
+        self.active = 0
+        self.waiting = 0
+    async def __aenter__(self):
+        if self._sem is not None:
+            self.waiting += 1
+            try: await self._sem.acquire()
+            finally: self.waiting -= 1
+        self.active += 1
+        return self
+    async def __aexit__(self, exc_type, exc, tb):
+        self.active -= 1
+        if self._sem is not None: self._sem.release()
+        return False
+    def locked(self): return self._sem is not None and self.active >= self.n
+
+DL_SEM, UP_SEM, PROBE_SEM = Gate(MAX_DL), Gate(MAX_UP), Gate(MAX_PROBES)
+_USER_GATES = {}
 
 def user_sem(uid):
-    return UNLIMITED
+    """سقف لكل مستخدم عشان واحد مايستهلكش السيرفر لوحده."""
+    if MAX_PER_USER <= 0: return UNLIMITED
+    g = _USER_GATES.get(uid)
+    if g is None: g = _USER_GATES[uid] = Gate(MAX_PER_USER)
+    return g
+
+def prune_user_gates():
+    for uid, g in list(_USER_GATES.items()):
+        if g.active == 0 and g.waiting == 0: _USER_GATES.pop(uid, None)
 URL_RE = re.compile(r"https?://[^\s<>\"']+")
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -210,6 +253,8 @@ def save_cookies_text(raw):
         os.replace(tmp, COOKIE_FILE)
         try: os.chmod(COOKIE_FILE, 0o600)
         except OSError: pass
+        try: PROBE_CACHE.clear()          # الكوكيز اتغيّرت: نتايج الفحص القديمة ممكن تبقى غلط
+        except NameError: pass
         return True, f"{total} كوكي ({yt} ليوتيوب/جوجل)" + ("" if login else " ⚠️ مفيش جلسة تسجيل دخول جواهم")
     except Exception as e:
         try: os.remove(tmp)
@@ -235,7 +280,8 @@ def seed_cookies_from_env():
 seed_cookies_from_env()
 db = sqlite3.connect(DB_PATH, check_same_thread=False)
 db_lock = threading.Lock()
-for _pragma in ("PRAGMA journal_mode=WAL", "PRAGMA synchronous=NORMAL"):
+for _pragma in ("PRAGMA journal_mode=WAL", "PRAGMA synchronous=NORMAL", "PRAGMA busy_timeout=5000",
+                "PRAGMA temp_store=MEMORY"):
     try: db.execute(_pragma)
     except sqlite3.DatabaseError: pass
 db.executescript("""
@@ -253,6 +299,12 @@ CREATE TABLE IF NOT EXISTS favorites(user_id INTEGER, url TEXT, title TEXT, ts I
 CREATE TABLE IF NOT EXISTS watch(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, url TEXT, title TEXT,
                                  seen TEXT, mode TEXT, ts INTEGER, UNIQUE(user_id, url));
 """)
+# فهارس (v12): السجل/الحصة/التقارير كانت بتعمل full scan على جدول history كل مرة
+for _idx in ("CREATE INDEX IF NOT EXISTS idx_history_user_ts ON history(user_id, ts DESC)",
+             "CREATE INDEX IF NOT EXISTS idx_history_ts ON history(ts)",
+             "CREATE INDEX IF NOT EXISTS idx_urlmap_ts ON urlmap(ts)"):
+    try: db.execute(_idx); db.commit()
+    except sqlite3.DatabaseError: pass
 for _alter in ("ALTER TABLE users ADD COLUMN quality TEXT DEFAULT 'ask'",
                "ALTER TABLE cache ADD COLUMN ts INTEGER DEFAULT 0",
                "ALTER TABLE history ADD COLUMN url TEXT DEFAULT ''",
@@ -1309,6 +1361,51 @@ def probe(url):
                              engine="cobalt")], None
             raise first
 
+# ───────────── كاش الفحص + دمج الطلبات المتطابقة (v12) ─────────────
+PROBE_CACHE = {}        # url -> (وقت, [Item], عنوان_القائمة)
+PROBE_FLIGHTS = {}      # url -> Task شغّال دلوقتي: طلبين لنفس الرابط = فحص واحد بس
+
+def _probe_cacheable(items):
+    if len(items) != 1: return False
+    it = items[0]
+    info = it.info
+    if it.engine != "ytdlp" or not isinstance(info, dict) or not info.get("formats"): return False
+    return not (info.get("is_live") or info.get("live_status") in ("is_live", "is_upcoming"))
+
+def _probe_clone(items, ptitle):
+    # نسخ جديدة من Item (الحالة بتتغيّر)؛ نتيجة الفحص نفسها (info) مشتركة للقراءة بس
+    return [dc_replace(i) for i in items], ptitle
+
+def probe_cache_trim():
+    now = time.monotonic()
+    for k in [k for k, v in PROBE_CACHE.items() if now - v[0] >= PROBE_TTL]:
+        PROBE_CACHE.pop(k, None)
+    while len(PROBE_CACHE) >= PROBE_CACHE_MAX:
+        PROBE_CACHE.pop(next(iter(PROBE_CACHE)), None)
+
+async def probe_shared(url):
+    """فحص الرابط بسقف PROBE_SEM، مع كاش PROBE_TTL ثانية، ودمج الطلبات المتزامنة لنفس الرابط في فحص واحد."""
+    hit = PROBE_CACHE.get(url)
+    if hit and PROBE_TTL and time.monotonic() - hit[0] < PROBE_TTL:
+        return _probe_clone(hit[1], hit[2])
+    task = PROBE_FLIGHTS.get(url)
+    if task is None:
+        async def _run():
+            async with PROBE_SEM:
+                return await asyncio.to_thread(probe, url)
+        task = asyncio.ensure_future(_run())
+        PROBE_FLIGHTS[url] = task
+        def _done(t, url=url):
+            PROBE_FLIGHTS.pop(url, None)
+            if t.cancelled() or t.exception() is not None: return
+            items, pl = t.result()
+            if PROBE_TTL and _probe_cacheable(items):
+                probe_cache_trim()
+                PROBE_CACHE[url] = (time.monotonic(), items, pl)
+        task.add_done_callback(_done)
+    items, pl = await asyncio.shield(task)
+    return _probe_clone(items, pl)
+
 def check_limits(info):
     """يرفض البث المباشر، والفيديو الأطول من حد المدة اللي ضابطه الأدمن (الافتراضي بلا حد)."""
     if not info: return
@@ -1975,6 +2072,61 @@ async def send_gallery(b, it, files, progress_factory=None):
                                 progress=progress_factory("رفع ملف")); first = False
 
 # ───────────── معالجة عنصر واحد ─────────────
+class Flight:
+    __slots__ = ("lock", "refs", "err", "err_at")
+    def __init__(self):
+        self.lock, self.refs, self.err, self.err_at = asyncio.Lock(), 0, None, 0.0
+
+FLIGHTS = {}
+
+class flight:
+    """نفس (الفيديو + الجودة) مطلوب من أكتر من عنصر في نفس الوقت → واحد بس بيحمّل، والباقي بيستنى.
+    لو اللي حمّل فشل، اللي مستنيين بياخدوا نفس الخطأ فورًا بدل ما كل واحد يعيد المحاولة ويستنى."""
+    def __init__(self, key, batch):
+        self.key, self.batch, self.f = key, batch, None
+    async def __aenter__(self):
+        f = FLIGHTS.get(self.key)
+        if f is None: f = FLIGHTS[self.key] = Flight()
+        f.refs += 1
+        self.f = f
+        try:
+            await f.lock.acquire()
+        except BaseException:
+            self._unref()
+            raise
+        return f
+    def _unref(self):
+        self.f.refs -= 1
+        if self.f.refs <= 0 and FLIGHTS.get(self.key) is self.f: FLIGHTS.pop(self.key, None)
+    async def __aexit__(self, et, ev, tb):
+        f = self.f
+        if et is None:
+            f.err = None
+        elif issubclass(et, Exception) and not self.batch.cancelled and str(ev):
+            f.err, f.err_at = str(ev), time.monotonic()
+        f.lock.release()
+        self._unref()
+        return False
+
+async def _send_from_cache(b, it, cm):
+    """True لو العنصر اتبعت من الكاش (file_id متخزّن). file_id باظ → بيتمسح من الكاش."""
+    fid = cache_get(it.key, cm)
+    if not fid: return False
+    try:
+        it.status, it.detail = "up", "فوري ⚡"
+        await send_media(b, it, fid, None)
+        it.status, it.route, it.took = "done", "cache", time.monotonic() - it.t0
+        record(b.user_id, it.title, b.mode, it.url)
+        return True
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        log.warning("cache miss for %s: %s", it.key, e)
+        if isinstance(e, BadRequest):
+            db_exec("DELETE FROM cache WHERE key=? AND mode=?", (it.key, cm))
+        it.status, it.detail = "wait", ""
+        return False
+
 async def run_item(b, it):
     async with b.sem:
         if b.cancelled:
@@ -1988,109 +2140,122 @@ async def run_item(b, it):
         cm = cache_mode(b.mode, wm)
         try:
             if it.engine in ("ytdlp", "cobalt"):
-                fid = cache_get(it.key, cm)
-                if fid:
-                    try:
-                        it.status, it.detail = "up", "فوري ⚡"
-                        await send_media(b, it, fid, None)
-                        it.status, it.route, it.took = "done", "cache", time.monotonic() - it.t0
-                        record(b.user_id, it.title, b.mode, it.url)
-                        return
-                    except Exception as e:
-                        log.warning("cache miss for %s: %s", it.key, e)
-
-            if it.engine == "cobalt":
-                fid = await run_cobalt(b, it)
-                if fid: cache_put(it.key, cm, fid)
-                it.status = "done"; record(b.user_id, it.title, b.mode, it.url)
-                return
-
-            # ⚡ المسار السريع: بث مباشر من رابط المصدر لتليجرام (بدون تنزيل على السيرفر) لو الصيغة تسمح.
-            # أي فشل هنا بيرجّع تلقائيًا للمسار العادي تحت — المستخدم مش بيشوف فرق غير في السرعة.
-            if it.engine == "ytdlp" and cfg("xfer") == "direct" and not wm and not b.cancelled:
-                plan = None
-                try:
-                    it.status, it.detail = "dl", "⚡ بفحص أسرع مسار للإرسال..."
-                    plan = await asyncio.to_thread(plan_direct, it, b.mode)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as e:
-                    log.info("direct plan unavailable for %s: %s", it.url, e)
-                if plan:
-                    try:
-                        fid = await send_direct(b, it, plan)
-                        if fid: cache_put(it.key, cm, fid)
-                        it.status, it.route, it.took = "done", "direct", time.monotonic() - it.t0
-                        record(b.user_id, it.title, b.mode, it.url)
-                        it.info = None
-                        return
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as e:
-                        if b.cancelled: raise RuntimeError("أُلغي")
-                        log.warning("direct stream failed for %s (%s) — falling back to server download", it.url, e)
-                        it.status, it.detail = "dl", "جارٍ تجهيز التنزيل..."
-
-            outdir = tempfile.mkdtemp(prefix="dl_")
-            try:
-                if it.engine == "gallery":
-                    async with user_sem(b.user_id), DL_SEM:
-                        it.status, it.detail = "dl", "جارٍ تجهيز تنزيل الصور..."
-                        task = asyncio.create_task(asyncio.to_thread(do_gallery, it.url, outdir))
-                        files = await wait_with_progress(task, it, outdir)
-                    if b.cancelled: raise RuntimeError("أُلغي")
-                    async with UP_SEM:
-                        it.status, it.detail = "up", f"بدء رفع {len(files)} ملف..."
-                        await with_retry(send_gallery, b, it, files,
-                                         lambda label: make_upload_progress(it, label), tries=2)
-                    it.status = "done"; record(b.user_id, it.title, "gallery", it.url)
-                    return
-
-                async with user_sem(b.user_id), DL_SEM:
-                    it.status, it.detail = "dl", "جارٍ تجهيز التنزيل..."
-                    await wait_disk()
-                    loop = asyncio.get_running_loop()
-                    progress_state = {"updated": time.monotonic(), "started": time.monotonic()}
-                    hook = make_download_progress_hook(it, loop, progress_state)
-                    task = asyncio.create_task(asyncio.to_thread(
-                        do_download_fit, it, b.mode, outdir, hook))
-                    path, info, used = await wait_with_progress(task, it, outdir, progress_state)
-                    elapsed = time.monotonic() - progress_state["started"]
-                    it.size = os.path.getsize(path)
-                    it.v_dl = it.size / max(elapsed, 0.01)
-                    speed_note("dl", it.v_dl, it.size)
-                    it.detail = (f"<b>📊 100%</b>  {ui_bar(1, 12)}\n"
-                                 f"📦 {human_bytes(it.size)}  •  ⏱ مستغرق: {duration_text(elapsed)}\n"
-                                 "✅ اكتمل التنزيل")
-                    if wm and not b.cancelled:
-                        it.detail = "🔖 بيحط العلامة المائية..."
-                        path = await apply_watermark(path, wm, outdir)
-                        if os.path.getsize(path) > max_size():
-                            raise RuntimeError("الملف بعد العلامة المائية أكبر من الحد المسموح")
-                if b.cancelled: raise RuntimeError("أُلغي")
-                if used != b.mode: log.info("quality lowered %s -> %s for %s", b.mode, used, it.url)
-
-                async with UP_SEM:
-                    it.status, it.detail = "up", "جارٍ تهيئة الرفع..."
-                    prog = make_upload_progress(it)
-                    thumb = await get_thumb(info or it.info, outdir)         # صورة الفيديو الأصلية
-                    if not thumb and b.mode != "audio":
-                        thumb = await make_thumb(path, f"{outdir}/thumb.jpg")   # أو فريم من الفيديو نفسه
-                    t_up = time.monotonic()
-                    fid = await with_retry(send_media, b, it, path, info, thumb, prog)
-                    it.v_up = (it.size or os.path.getsize(path)) / max(time.monotonic() - t_up, 0.01)
-                    speed_note("up", it.v_up, it.size)
-                if fid: cache_put(it.key, cm, fid)
-                it.status, it.route, it.took = "done", "disk", time.monotonic() - it.t0
-                record(b.user_id, it.title, b.mode, it.url)
-            finally:
-                it.info = None
-                shutil.rmtree(outdir, ignore_errors=True)
+                if await _send_from_cache(b, it, cm): return
+                # لو نفس الفيديو بنفس الجودة بيتحمّل دلوقتي لحد تاني: نستنى ونستلمه من الكاش بدل ما نحمّله تاني
+                async with flight((it.key, cm), b) as fl:
+                    if fl.err and time.monotonic() - fl.err_at < 30:
+                        raise RuntimeError(fl.err)
+                    if await _send_from_cache(b, it, cm): return
+                    await _fetch_and_send(b, it, cm, wm)
+            else:
+                await _fetch_and_send(b, it, cm, wm)
         except asyncio.CancelledError:
             raise
         except Exception as e:
             it.status, it.detail = "err", clean_err(e)
             log.warning("item failed %s: %s", it.url, e)
+
+async def _fetch_and_send(b, it, cm, wm):
+    """تحميل/بث عنصر وإرساله (من غير الكاش). الأخطاء بتطلع لـ run_item."""
+    if it.engine == "cobalt":
+        it.status = "wait"
+        async with user_sem(b.user_id), DL_SEM:
+            if b.cancelled: raise RuntimeError("أُلغي")
+            fid = await run_cobalt(b, it)
+        if fid: cache_put(it.key, cm, fid)
+        it.status = "done"; record(b.user_id, it.title, b.mode, it.url)
+        return
+
+    # ⚡ المسار السريع: بث مباشر من رابط المصدر لتليجرام (بدون تنزيل على السيرفر) لو الصيغة تسمح.
+    # أي فشل هنا بيرجّع تلقائيًا للمسار العادي تحت — المستخدم مش بيشوف فرق غير في السرعة.
+    if it.engine == "ytdlp" and cfg("xfer") == "direct" and not wm and not b.cancelled:
+        plan = None
+        try:
+            it.status, it.detail = "dl", "⚡ بفحص أسرع مسار للإرسال..."
+            async with PROBE_SEM:
+                plan = await asyncio.to_thread(plan_direct, it, b.mode)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.info("direct plan unavailable for %s: %s", it.url, e)
+        if plan:
+            try:
+                it.status, it.detail = "wait", ""
+                async with user_sem(b.user_id), UP_SEM:
+                    if b.cancelled: raise RuntimeError("أُلغي")
+                    fid = await send_direct(b, it, plan)
+                if fid: cache_put(it.key, cm, fid)
+                it.status, it.route, it.took = "done", "direct", time.monotonic() - it.t0
+                record(b.user_id, it.title, b.mode, it.url)
+                it.info = None
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                if b.cancelled: raise RuntimeError("أُلغي")
+                log.warning("direct stream failed for %s (%s) — falling back to server download", it.url, e)
+                it.status, it.detail = "dl", "جارٍ تجهيز التنزيل..."
+
+    outdir = tempfile.mkdtemp(prefix="dl_")
+    try:
+        if it.engine == "gallery":
+            it.status = "wait"
+            async with user_sem(b.user_id), DL_SEM:
+                it.status, it.detail = "dl", "جارٍ تجهيز تنزيل الصور..."
+                task = asyncio.create_task(asyncio.to_thread(do_gallery, it.url, outdir))
+                files = await wait_with_progress(task, it, outdir)
+            if b.cancelled: raise RuntimeError("أُلغي")
+            it.status = "wait"
+            async with UP_SEM:
+                it.status, it.detail = "up", f"بدء رفع {len(files)} ملف..."
+                await with_retry(send_gallery, b, it, files,
+                                 lambda label: make_upload_progress(it, label), tries=2)
+            it.status = "done"; record(b.user_id, it.title, "gallery", it.url)
+            return
+
+        it.status = "wait"
+        async with user_sem(b.user_id), DL_SEM:
+            if b.cancelled: raise RuntimeError("أُلغي")
+            it.status, it.detail = "dl", "جارٍ تجهيز التنزيل..."
+            await wait_disk()
+            loop = asyncio.get_running_loop()
+            progress_state = {"updated": time.monotonic(), "started": time.monotonic()}
+            hook = make_download_progress_hook(it, loop, progress_state)
+            task = asyncio.create_task(asyncio.to_thread(
+                do_download_fit, it, b.mode, outdir, hook))
+            path, info, used = await wait_with_progress(task, it, outdir, progress_state)
+            elapsed = time.monotonic() - progress_state["started"]
+            it.size = os.path.getsize(path)
+            it.v_dl = it.size / max(elapsed, 0.01)
+            speed_note("dl", it.v_dl, it.size)
+            it.detail = (f"<b>📊 100%</b>  {ui_bar(1, 12)}\n"
+                         f"📦 {human_bytes(it.size)}  •  ⏱ مستغرق: {duration_text(elapsed)}\n"
+                         "✅ اكتمل التنزيل")
+            if wm and not b.cancelled:
+                it.detail = "🔖 بيحط العلامة المائية..."
+                path = await apply_watermark(path, wm, outdir)
+                if os.path.getsize(path) > max_size():
+                    raise RuntimeError("الملف بعد العلامة المائية أكبر من الحد المسموح")
+        if b.cancelled: raise RuntimeError("أُلغي")
+        if used != b.mode: log.info("quality lowered %s -> %s for %s", b.mode, used, it.url)
+
+        it.status = "wait"
+        async with UP_SEM:
+            it.status, it.detail = "up", "جارٍ تهيئة الرفع..."
+            prog = make_upload_progress(it)
+            thumb = await get_thumb(info or it.info, outdir)         # صورة الفيديو الأصلية
+            if not thumb and b.mode != "audio":
+                thumb = await make_thumb(path, f"{outdir}/thumb.jpg")   # أو فريم من الفيديو نفسه
+            t_up = time.monotonic()
+            fid = await with_retry(send_media, b, it, path, info, thumb, prog)
+            it.v_up = (it.size or os.path.getsize(path)) / max(time.monotonic() - t_up, 0.01)
+            speed_note("up", it.v_up, it.size)
+        if fid: cache_put(it.key, cm, fid)
+        it.status, it.route, it.took = "done", "disk", time.monotonic() - it.t0
+        record(b.user_id, it.title, b.mode, it.url)
+    finally:
+        it.info = None
+        shutil.rmtree(outdir, ignore_errors=True)
 
 # ───────────── شاشة الحالة ─────────────
 SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
@@ -2250,7 +2415,7 @@ async def run_batch(b):
                 try: await app.send_chat_action(b.chat_id, action)
                 except Exception: pass
             tick += 1
-            await asyncio.sleep(2)
+            await asyncio.sleep(min(8.0, max(2.0, len(batches) / 15)))    # كتير شغّالين = تحديث أبطأ (حماية من FloodWait)
     ui = asyncio.create_task(loop())
     await asyncio.gather(*tasks, return_exceptions=True)
     b.done = True
@@ -2693,6 +2858,11 @@ def runtime_metrics_text():
         except OSError:
             lines.append(f"💾 {label}: غير متاح")
     lines.append(f"⏱ مدة تشغيل العملية: {uptime_text}")
+    def _gate(label, g):
+        cap = g.n or "∞"
+        return f"{label} {g.active}/{cap}" + (f" (+{g.waiting} منتظر)" if g.waiting else "")
+    lines.append("🚦 " + " • ".join([_gate("تنزيل", DL_SEM), _gate("رفع", UP_SEM), _gate("فحص", PROBE_SEM)])
+                 + f" • دفعات {len(batches)} • كاش فحص {len(PROBE_CACHE)}")
     return "\n".join(lines)
 
 _speed_running = False
@@ -3272,12 +3442,22 @@ def watch_view(uid):
     return (ui_title("🔔", f"قنواتي المراقبة ({len(rows_db)})", "🏷 = فلتر العنوان • 🗑 = حذف") + "\n" + ui_quote(*lines)
             + f"\n<i>الفحص كل {int(WATCH_EVERY_MIN)} دقيقة • للإضافة: /watch رابط_القناة [الجودة]</i>", KB(*kb))
 
-async def watch_check(row):
+WATCH_MEMO = {}
+
+async def watch_fetch_cached(url, fresh=False, ttl=120):
+    """نفس القناة متراقبة عند أكتر من مستخدم → فحص واحد في الدورة بدل فحص لكل مستخدم."""
+    hit = WATCH_MEMO.get(url)
+    if hit and not fresh and time.monotonic() - hit[0] < ttl: return hit[1]
+    res = await asyncio.to_thread(watch_fetch, url, 10)
+    WATCH_MEMO[url] = (time.monotonic(), res)
+    return res
+
+async def watch_check(row, fresh=False):
     rid, uid, url, title, seen_json, mode, kw = row
     if not is_allowed(uid) or is_banned(uid): return 0
     try: seen = list(json.loads(seen_json or "[]"))
     except ValueError: seen = []
-    name, ents = await asyncio.to_thread(watch_fetch, url, 10)
+    name, ents = await watch_fetch_cached(url, fresh=fresh)
     if not ents: return 0
     known = set(seen)
     new = [e for e in ents if e[0] not in known and not e[3]]
@@ -3390,8 +3570,7 @@ async def handle_urls(m, uid, urls, force_mode=None):
     async def _probe(u):
         hit = await asyncio.to_thread(urlmap_get, u)
         try:
-            async with PROBE_SEM:
-                result = await asyncio.to_thread(probe, u)
+            result = await probe_shared(u)
             if hit and len(result[0]) == 1 and result[0][0].engine == "ytdlp":
                 result[0][0].key = hit[0]   # احتفظ بمفتاح كاش الملف بعد فحص metadata الجديد
                 if not result[0][0].title: result[0][0].title = hit[1] or u
@@ -3581,7 +3760,7 @@ async def on_cb(_, cq):
             await cq.answer("🔄 بفحص القنوات...")
             n = 0
             for row in db_exec("SELECT id, user_id, url, title, seen, mode, COALESCE(kw, '') FROM watch WHERE user_id=?", (uid,)):
-                try: n += await watch_check(row)
+                try: n += await watch_check(row, fresh=True)
                 except Exception as e: log.info("manual watch check failed: %s", e)
             if not n: await cq.answer("مفيش فيديوهات جديدة", show_alert=True)
             return
@@ -3799,9 +3978,17 @@ async def on_cb(_, cq):
 # ───────────── التشغيل ─────────────
 async def batch_gc_loop():
     """بيمسح الطلبات اللي اتفحصت ومحدش اختار لها جودة/فيديوهات (بتفضل في الذاكرة وفي ملف المعاينة للأبد)."""
+    last_db_prune = 0.0
     while True:
         await asyncio.sleep(600)
         try:
+            prune_user_gates()
+            probe_cache_trim()
+            WATCH_MEMO.clear() if len(WATCH_MEMO) > 200 else None
+            await asyncio.to_thread(clean_stale_tmp, 21600)         # بقايا تحميلات أقدم من 6 ساعات
+            if time.time() - last_db_prune > 86400:                  # مرة كل يوم: روابط قديمة جدًا من urlmap
+                last_db_prune = time.time()
+                await asyncio.to_thread(db_exec, "DELETE FROM urlmap WHERE ts < ?", (int(time.time()) - 120 * 86400,))
             for bid, bb in list(batches.items()):
                 if not bb.started and not bb.done and time.time() - bb.created > 3600:
                     batches.pop(bid, None)
